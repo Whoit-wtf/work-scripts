@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -9,12 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
 func main() {
-	// Параметры подключения (можно заменить на чтение из аргументов или конфига)
+	// Параметры подключения
 	username := "your_username"
 	privateKeyPath := "/path/to/private/key"
 	serverListFile := "servers.txt"
@@ -38,7 +38,7 @@ func main() {
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Внимание: небезопасно для продакшена!
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         30 * time.Second,
 	}
 
@@ -71,68 +71,91 @@ func processServer(server string, config *ssh.ClientConfig, localBaseDir string)
 	}
 	defer conn.Close()
 
-	// Создание SFTP-клиента
-	sftpClient, err := sftp.NewClient(conn)
-	if err != nil {
-		return fmt.Errorf("SFTP client creation failed: %w", err)
-	}
-	defer sftpClient.Close()
-
 	// Получение списка приложений
-	appsDir := "/opt/solar"
-	appDirs, err := sftpClient.ReadDir(appsDir)
+	apps, err := listApplications(conn)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", appsDir, err)
+		return fmt.Errorf("failed to list applications: %w", err)
 	}
 
 	// Обработка каждого приложения
-	for _, appDir := range appDirs {
-		if !appDir.IsDir() {
-			continue
-		}
+	for _, app := range apps {
+		remotePath := fmt.Sprintf("/opt/solar/%s/config/context.xml", app)
+		localDir := filepath.Join(localBaseDir, server, app)
+		localPath := filepath.Join(localDir, "context.xml")
 
-		appName := appDir.Name()
-		remoteFile := fmt.Sprintf("%s/%s/config/context.xml", appsDir, appName)
-		localDir := filepath.Join(localBaseDir, server, appName)
-		localFile := filepath.Join(localDir, "context.xml")
-
-		// Скачивание файла
-		if err := downloadFile(sftpClient, remoteFile, localFile); err != nil {
-			log.Printf("  [%s] Error: %v", appName, err)
+		// Скачивание файла с помощью cat
+		if err := downloadViaCat(conn, remotePath, localPath); err != nil {
+			log.Printf("  [%s] Error: %v", app, err)
 		} else {
-			log.Printf("  [%s] Downloaded successfully", appName)
+			log.Printf("  [%s] Downloaded successfully", app)
 		}
 	}
 
 	return nil
 }
 
-func downloadFile(sftpClient *sftp.Client, remotePath, localPath string) error {
+func listApplications(conn *ssh.Client) ([]string, error) {
+	session, err := conn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("session creation failed: %w", err)
+	}
+	defer session.Close()
+
+	// Выполнение команды для получения списка приложений
+	output, err := session.Output("ls -1 /opt/solar")
+	if err != nil {
+		return nil, fmt.Errorf("command failed: %w", err)
+	}
+
+	var apps []string
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		app := strings.TrimSpace(scanner.Text())
+		if app != "" {
+			apps = append(apps, app)
+		}
+	}
+
+	return apps, nil
+}
+
+func downloadViaCat(conn *ssh.Client, remotePath, localPath string) error {
 	// Создание локальной директории
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return fmt.Errorf("failed to create local directory: %w", err)
 	}
 
-	// Открытие удаленного файла
-	srcFile, err := sftpClient.Open(remotePath)
+	// Создание файла для записи
+	file, err := os.Create(localPath)
 	if err != nil {
-		return fmt.Errorf("failed to open remote file: %w", err)
+		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer srcFile.Close()
+	defer file.Close()
 
-	// Создание локального файла
-	dstFile, err := os.Create(localPath)
+	// Создание SSH-сессии
+	session, err := conn.NewSession()
 	if err != nil {
-		return fmt.Errorf("failed to create local file: %w", err)
+		return fmt.Errorf("session creation failed: %w", err)
 	}
-	defer dstFile.Close()
+	defer session.Close()
 
-	// Копирование содержимого
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return fmt.Errorf("copy failed: %w", err)
+	// Перенаправление вывода команды в файл
+	session.Stdout = file
+
+	// Экранирование пути для безопасной передачи
+	escapedPath := escapeShellArg(remotePath)
+	cmd := fmt.Sprintf("cat %s", escapedPath)
+
+	// Выполнение команды
+	if err := session.Run(cmd); err != nil {
+		return fmt.Errorf("command execution failed: %w", err)
 	}
 
 	return nil
+}
+
+func escapeShellArg(s string) string {
+	return "'" + strings.Replace(s, "'", "'\"'\"'", -1) + "'"
 }
 
 func readLines(filename string) ([]string, error) {
