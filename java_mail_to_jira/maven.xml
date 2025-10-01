@@ -1,0 +1,23 @@
+<dependency>
+<groupId>com.sun.mail</groupId>
+<artifactId>javax.mail</artifactId>
+<version>1.6.2</version>
+</dependency>
+
+<!-- jira client -->
+<dependency>
+    <groupId>com.atlassian.jira</groupId>
+    <artifactId>jira-rest-java-client-core</artifactId>
+    <version>5.1.6</version>
+</dependency>
+<dependency>
+    <groupId>com.atlassian.jira</groupId>
+    <artifactId>jira-rest-java-client-api</artifactId>
+    <version>5.1.6</version>
+</dependency>
+<dependency>
+    <groupId>io.atlassian.fugue</groupId>
+    <artifactId>fugue</artifactId>
+    <version>4.7.2</version>
+    <scope>provided</scope>
+</dependency>
