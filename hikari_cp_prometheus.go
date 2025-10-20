@@ -1,165 +1,142 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
-const (
-	prometheusURL = "http://localhost:9090" // Замените на адрес вашего Prometheus
-	metricName    = "hikaricp_connections"
-	outputFile    = "hikaricp_stats.txt"
-)
-
-// PrometheusResponse представляет структуру ответа от Prometheus API
+// PrometheusResponse представляет структуру ответа Prometheus API
 type PrometheusResponse struct {
 	Data struct {
 		Result []struct {
-			Metric struct {
-				Instance string `json:"instance"`
-				AppName  string `json:"appName"`
-				Pool     string `json:"pool"`
-			} `json:"metric"`
-			Values [][]interface{} `json:"values"`
+			Metric map[string]string `json:"metric"`
+			Value  []interface{}     `json:"value"`
 		} `json:"result"`
 	} `json:"data"`
 }
 
-func main() {
-	ctx := context.Background()
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	// Получаем данные за последнюю неделю
-	end := time.Now()
-	start := end.Add(-7 * 24 * time.Hour)
-	step := "1h" // Шаг для агрегации данных
-
-	query := fmt.Sprintf("%s[7d]", metricName)
-	stats, err := fetchPrometheusStats(ctx, client, query, start, end, step)
-	if err != nil {
-		log.Fatal("Ошибка при получении данных: ", err)
-	}
-
-	// Записываем результаты в файл
-	if err := writeResultsToFile(stats); err != nil {
-		log.Fatal("Ошибка при записи в файл: ", err)
-	}
-
-	fmt.Printf("Статистика сохранена в файл %s\n", outputFile)
+// MetricResult хранит данные метрики с распарсенными значениями
+type MetricResult struct {
+	Labels  map[string]string
+	Value   float64
+	SortKey string
 }
 
-func fetchPrometheusStats(
-	ctx context.Context,
-	client *http.Client,
-	query string,
-	start, end time.Time,
-	step string,
-) (map[string]map[string]map[string]*PoolStats, error) {
-	// Формируем URL запроса
-	params := url.Values{}
-	params.Add("query", query)
-	params.Add("start", start.Format(time.RFC3339))
-	params.Add("end", end.Format(time.RFC3339))
-	params.Add("step", step)
+func main() {
+	prometheusURL := "http://localhost:9090/api/v1/query"
 
-	reqURL := fmt.Sprintf("%s/api/v1/query_range?%s", prometheusURL, params.Encode())
+	// Выполняем запросы
+	maxConnections := queryPrometheus(prometheusURL, "hikaricp_connections_max")
+	maxOverTime := queryPrometheus(prometheusURL, "max_over_time(hikaricp_connections{}[7d])")
 
-	// Выполняем запрос
-	resp, err := client.Get(reqURL)
+	// Создаем мапу для объединения результатов
+	results := make(map[string][2]float64)
+
+	// Обрабатываем первый запрос
+	for _, mr := range maxConnections {
+		key := mr.SortKey
+		results[key] = [2]float64{mr.Value, 0}
+	}
+
+	// Объединяем со вторым запросом
+	for _, mr := range maxOverTime {
+		key := mr.SortKey
+		if existing, exists := results[key]; exists {
+			existing[1] = mr.Value
+			results[key] = existing
+		}
+	}
+
+	// Подготавливаем данные для вывода
+	var output []string
+	for key, values := range results {
+		if values[0] != 0 && values[1] != 0 {
+			parts := strings.Split(key, "|")
+			output = append(output, fmt.Sprintf("%s|%.0f|%.0f", key, values[0], values[1]))
+		}
+	}
+
+	// Сортируем вывод для удобства
+	sort.Strings(output)
+
+	// Выводим результаты
+	fmt.Println("appName|instance|job|nodeName|pool|connections_max|max_over_time_7d")
+	for _, line := range output {
+		fmt.Println(line)
+	}
+}
+
+// queryPrometheus выполняет запрос к Prometheus и возвращает результаты
+func queryPrometheus(baseURL, query string) []MetricResult {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", baseURL, nil)
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
+	}
+
+	// Параметры запроса
+	q := url.Values{}
+	q.Add("query", query)
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatal(err)
 	}
 	defer resp.Body.Close()
 
-	var result PrometheusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	// Агрегируем статистику
-	stats := make(map[string]map[string]map[string]*PoolStats)
-	for _, series := range result.Data.Result {
-		instance := series.Metric.Instance
-		appName := series.Metric.AppName
-		pool := series.Metric.Pool
-
-		if _, exists := stats[instance]; !exists {
-			stats[instance] = make(map[string]map[string]*PoolStats)
-		}
-		if _, exists := stats[instance][appName]; !exists {
-			stats[instance][appName] = make(map[string]*PoolStats)
-		}
-
-		if _, exists := stats[instance][appName][pool]; !exists {
-			stats[instance][appName][pool] = &PoolStats{}
-		}
-
-		// Обрабатываем все значения временного ряда
-		for _, value := range series.Values {
-			if len(value) < 2 {
-				continue
-			}
-
-			strVal, ok := value[1].(string)
-			if !ok {
-				continue
-			}
-
-			val, err := strconv.ParseFloat(strVal, 64)
-			if err != nil {
-				continue
-			}
-
-			stats[instance][appName][pool].Update(val)
-		}
-	}
-
-	return stats, nil
-}
-
-// PoolStats хранит статистику по пулу соединений
-type PoolStats struct {
-	Total float64
-	Max   float64
-}
-
-func (ps *PoolStats) Update(value float64) {
-	ps.Total = value // Используем последнее значение как общее количество
-	if value > ps.Max {
-		ps.Max = value
-	}
-}
-
-func writeResultsToFile(stats map[string]map[string]map[string]*PoolStats) error {
-	file, err := os.Create(outputFile)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	defer file.Close()
 
-	for instance, appMap := range stats {
-		for appName, poolMap := range appMap {
-			for pool, poolStats := range poolMap {
-				line := fmt.Sprintf("%s|%s|%s|%.0f|%.0f\n",
-					instance,
-					appName,
-					pool,
-					poolStats.Total,
-					poolStats.Max,
-				)
-				if _, err := file.WriteString(line); err != nil {
-					return err
-				}
-			}
+	var pr PrometheusResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		log.Fatal(err)
+	}
+
+	var results []MetricResult
+	for _, result := range pr.Data.Result {
+		// Извлекаем значение
+		if len(result.Value) < 2 {
+			continue
 		}
+
+		valStr, ok := result.Value[1].(string)
+		if !ok {
+			continue
+		}
+
+		value, err := strconv.ParseFloat(valStr, 64)
+		if err != nil {
+			continue
+		}
+
+		// Формируем ключ сортировки
+		labels := []string{
+			result.Metric["appName"],
+			result.Metric["instance"],
+			result.Metric["job"],
+			result.Metric["nodeName"],
+			result.Metric["pool"],
+		}
+		sortKey := strings.Join(labels, "|")
+
+		results = append(results, MetricResult{
+			Labels:  result.Metric,
+			Value:   value,
+			SortKey: sortKey,
+		})
 	}
 
-	return nil
+	return results
 }
